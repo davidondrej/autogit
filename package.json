@@ -1,0 +1,19 @@
+{
+  "name": "autogit-cli",
+  "version": "0.1.0",
+  "description": "Auto stage→commit→push for agentic engineers. Works with any coding agent.",
+  "author": "David Ondrej",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/davidondrej/autogit.git"
+  },
+  "bin": {
+    "autogit": "./index.js"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": ["git", "agents", "claude-code", "automation", "ai"],
+  "license": "MIT"
+}

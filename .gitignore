@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Environment / secrets
+.env
+.env.*
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+
+# Local autogit config (created when testing autogit on itself)
+.autogit.json
