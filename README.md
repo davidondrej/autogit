@@ -1,5 +1,7 @@
 # autogit
 
+<!-- Short-form README kept focused on the MVP flow. -->
+
 Your AI coding agent writes the code. **autogit ships it.**
 
 Every time your agent finishes a turn, autogit stages, commits, and pushes — automatically. Built for agentic engineers who don't write code by hand.

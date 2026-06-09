@@ -31,6 +31,7 @@ function repoRootOrNull() {
 }
 
 // ---------- secrets scanning ----------
+// Keep patterns conservative to avoid surprising false positives.
 
 const SECRET_PATTERNS = [
   { name: "AWS access key", re: /AKIA[0-9A-Z]{16}/ },
