@@ -4,15 +4,18 @@
 //   autogit setup     wire agent hooks globally (once per machine)
 //   autogit on/off    enable/disable auto-push in current repo
 //   autogit ship      stage, scan, commit, push (what the hooks run)
+//   autogit undo      take back the last autogit commit (local + remote)
 //   autogit status    show hooks + repo state
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, utimesSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
 const CONFIG_FILE = ".autogit.json";
 // Defaults mirror the MVP's current auto-push behavior.
 const DEFAULTS = { mode: "auto", remote: "origin", branch: "current", secretsScan: true };
+// Trailer added to every commit body — this is how `undo` knows a commit is ours.
+const SHIP_TRAILER = "Shipped-by: autogit";
 
 // ---------- helpers ----------
 // Helpers wrap git/fs calls so commands above stay readable.
@@ -241,10 +244,14 @@ function markerPath(root, id) {
 
 // `autogit busy` — called by agent start/tool hooks; touches this session's marker.
 // Must stay silent: some hooks treat stdout as context or JSON.
+// Marker content = the turn's user prompt (prompt-submit hooks carry it) —
+// ship reads it back as the commit subject. Tool hooks carry no prompt, so
+// they only refresh mtime and leave the stored prompt alone.
 function cmdBusy(args) {
   const payload = readStdinPayload();
   const id = sessionId(payload, args);
   if (!id) return; // no session id → no marker: nobody could ever clear it
+  const prompt = promptText(payload);
   const roots = payload?.workspace_roots?.length ? payload.workspace_roots : [process.cwd()];
   for (const dir of roots) {
     try {
@@ -253,15 +260,26 @@ function cmdBusy(args) {
       if (!root || !existsSync(path.join(root, CONFIG_FILE))) continue; // only opted-in repos
       const marker = markerPath(root, id);
       mkdirSync(path.dirname(marker), { recursive: true });
-      writeFileSync(marker, ""); // (re)write — mtime is the freshness signal
+      if (prompt || !existsSync(marker)) writeFileSync(marker, prompt || "");
+      else { const now = new Date(); utimesSync(marker, now, now); } // mtime is the freshness signal
     } catch {}
   }
 }
 
+// Read & clear this session's own marker; returns the stored prompt (if any).
+function takeOwnMarker(root, id) {
+  if (!id) return null;
+  try {
+    const p = markerPath(root, id);
+    const prompt = readFileSync(p, "utf8").trim();
+    unlinkSync(p);
+    return prompt || null;
+  } catch { return null; }
+}
+
 // Returns true if another agent is mid-turn in this repo. Cleans stale markers.
-function othersBusy(root, ownId) {
+function othersBusy(root) {
   const dir = busyDir(root);
-  if (ownId) { try { unlinkSync(markerPath(root, ownId)); } catch {} }
   if (!existsSync(dir)) return false;
   for (const f of readdirSync(dir)) {
     const p = path.join(dir, f);
@@ -282,6 +300,41 @@ function autoMessage(stagedFiles) {
   return `autogit: update ${head}${rest}`;
 }
 
+// Pull the user's prompt out of a hook payload. Prompt-submit payloads vary
+// per agent — check the common spellings, both string and { text } shapes.
+function promptText(payload) {
+  for (const v of [payload?.prompt, payload?.text, payload?.user_prompt, payload?.message]) {
+    if (typeof v === "string" && v.trim()) return v.trim();
+    if (typeof v?.text === "string" && v.text.trim()) return v.text.trim();
+  }
+  return null;
+}
+
+// Claude's Stop payload has no prompt, but points at the session transcript
+// (JSONL). Walk it backwards for the last real user message.
+function lastPromptFromTranscript(file) {
+  try {
+    const lines = readFileSync(file, "utf8").split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].trim()) continue;
+      let e; try { e = JSON.parse(lines[i]); } catch { continue; }
+      if (e.type !== "user" || e.isMeta) continue;
+      const c = e.message?.content;
+      const text = typeof c === "string" ? c
+        : Array.isArray(c) ? c.filter(p => p.type === "text").map(p => p.text).join(" ") : "";
+      if (!text.trim() || text.startsWith("<")) continue; // tool results / slash-command noise
+      return text.trim();
+    }
+  } catch {}
+  return null;
+}
+
+// One-line commit subject, capped at the conventional 72 chars.
+function subjectFrom(prompt) {
+  const s = prompt.replace(/\s+/g, " ").trim();
+  return s.length > 72 ? s.slice(0, 69).trimEnd() + "..." : s;
+}
+
 // Hooks (Cursor, Claude, Codex) pass a JSON payload on stdin.
 function readStdinPayload() {
   if (process.stdin.isTTY) return null;
@@ -298,10 +351,10 @@ function cmdShip(args) {
   // Cursor hooks run from ~/.cursor; the real project dirs come in the payload
   const roots = payload?.workspace_roots?.length ? payload.workspace_roots : [process.cwd()];
   const id = sessionId(payload, args);
-  for (const dir of roots) shipRepo(dir, args, id);
+  for (const dir of roots) shipRepo(dir, args, id, payload);
 }
 
-function shipRepo(dir, args, id) {
+function shipRepo(dir, args, id, payload) {
   try { process.chdir(dir); } catch { return; }
 
   // silent no-op unless this is a repo that opted in — hooks fire everywhere
@@ -311,8 +364,11 @@ function shipRepo(dir, args, id) {
   if (!existsSync(cfgPath)) return;
   process.chdir(root);
 
+  // clear our own marker first — it may hold this turn's prompt
+  const storedPrompt = takeOwnMarker(root, id);
+
   // another agent mid-turn? defer — the last one to finish ships everything
-  if (othersBusy(root, id)) {
+  if (othersBusy(root)) {
     console.error("autogit: deferred — another agent is still working in this repo.");
     return;
   }
@@ -345,12 +401,71 @@ function shipRepo(dir, args, id) {
   const branch = config.branch === "current" ? git("rev-parse", "--abbrev-ref", "HEAD").out : config.branch;
   if (branch === "HEAD") { git("reset"); die("detached HEAD — won't auto-push."); }
 
-  const commit = git("commit", "-m", message || autoMessage(staged));
+  // subject: explicit -m > this turn's prompt (busy marker, payload, or
+  // Claude transcript) > file-list fallback. Trailer marks the commit as ours.
+  const prompt = storedPrompt || promptText(payload)
+    || (payload?.transcript_path ? lastPromptFromTranscript(payload.transcript_path) : null);
+  const subject = message || (prompt ? subjectFrom(prompt) : autoMessage(staged));
+  const commit = git("commit", "-m", subject, "-m", SHIP_TRAILER);
   if (!commit.ok) die(`commit failed:\n${commit.out}`);
 
   const push = git("push", config.remote, `HEAD:${branch}`);
   if (!push.ok) die(`push failed (commit kept locally):\n${push.out}`);
   ok(`shipped ${staged.length} file(s) → ${config.remote}/${branch}`);
+}
+
+// ---------- undo ----------
+// Escape hatch: take back the last autogit commit. Rewinds the remote first
+// (only if it still points at the shipped commit), then undoes the local
+// commit, leaving the changes uncommitted in the working tree.
+// Run it again to peel off earlier autogit commits one at a time.
+
+function cmdUndo() {
+  const root = repoRootOrNull();
+  if (!root) die("not inside a git repository.");
+  process.chdir(root);
+
+  const head = git("rev-parse", "HEAD");
+  if (!head.ok) die("no commits in this repo.");
+  const subject = git("log", "-1", "--format=%s").out;
+  const body = git("log", "-1", "--format=%B").out;
+  // legacy "autogit:" prefix covers commits made before the trailer existed
+  if (!body.includes(SHIP_TRAILER) && !subject.startsWith("autogit:"))
+    die(`last commit ("${subject}") wasn't made by autogit — won't touch it.`);
+
+  const parent = git("rev-parse", "HEAD~1");
+  if (!parent.ok) die("the autogit commit is the repo's only commit — undo it manually.");
+
+  const branch = git("rev-parse", "--abbrev-ref", "HEAD").out;
+  if (branch === "HEAD") die("detached HEAD — undo manually.");
+
+  // config may be gone (autogit off) — undo still works, with defaults
+  let config = DEFAULTS;
+  const cfgPath = path.join(root, CONFIG_FILE);
+  if (existsSync(cfgPath)) {
+    try { config = { ...DEFAULTS, ...JSON.parse(readFileSync(cfgPath, "utf8")) }; } catch {}
+  }
+
+  // rewind the remote first, while local HEAD still matches what was pushed
+  const fetch = git("fetch", config.remote, branch);
+  if (fetch.ok) {
+    const remoteTip = git("rev-parse", "FETCH_HEAD").out;
+    if (remoteTip === head.out) {
+      const push = git("push", `--force-with-lease=${branch}:${head.out}`,
+        config.remote, `${parent.out}:refs/heads/${branch}`);
+      if (!push.ok) die(`couldn't rewind ${config.remote}/${branch}:\n${push.out}`);
+      ok(`rewound ${config.remote}/${branch} to ${parent.out.slice(0, 7)}`);
+    } else if (remoteTip !== parent.out) {
+      die(`${config.remote}/${branch} no longer matches the shipped commit — undo manually.`);
+    } // remoteTip === parent → the commit was never pushed; local undo only
+  } else if (/couldn't find remote ref/i.test(fetch.out)) {
+    // branch never reached the remote — local undo only
+  } else {
+    die(`could not reach ${config.remote} — fix the connection and rerun:\n${fetch.out}`);
+  }
+
+  git("reset", parent.out); // mixed reset: the changes come back, uncommitted
+  ok(`undid "${subject}" — changes are back (uncommitted) in your working tree.`);
 }
 
 // ---------- status ----------
@@ -386,6 +501,7 @@ switch (cmd) {
   case "on": cmdOn(); break;
   case "off": cmdOff(); break;
   case "ship": cmdShip(args); break;
+  case "undo": cmdUndo(); break;
   case "busy": cmdBusy(args); break;
   case "status": cmdStatus(); break;
   default:
@@ -395,11 +511,12 @@ switch (cmd) {
   autogit on        Enable auto-push in this repo
   autogit off       Disable auto-push in this repo
   autogit ship      Stage, scan, commit, push (hooks run this after every turn)
+  autogit undo      Take back the last autogit commit, local + remote (repeatable)
   autogit busy      Mark this repo busy (agent start/tool hooks run this)
   autogit status    Show hooks + repo state
 
 ship flags:
-  -m "message"      Commit message (auto-generated if omitted)
+  -m "message"      Commit message (defaults to the turn's prompt, else the file list)
   --force-secrets   Override a secrets-scan block
 
 Parallel agents in one repo: ship defers while another agent is mid-turn;
