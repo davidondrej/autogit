@@ -1,6 +1,6 @@
 {
   "name": "@davidondrej/autogit",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Auto stage→commit→push for agentic engineers. Works with any coding agent.",
   "author": "David Ondrej",
   "repository": {
@@ -10,11 +10,21 @@
   "bin": {
     "autogit": "index.js"
   },
-  "files": ["index.js", "README.md", "LICENSE"],
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
   "type": "module",
   "engines": {
     "node": ">=18"
   },
-  "keywords": ["git", "agents", "claude-code", "automation", "ai"],
+  "keywords": [
+    "git",
+    "agents",
+    "claude-code",
+    "automation",
+    "ai"
+  ],
   "license": "MIT"
 }
