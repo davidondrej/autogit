@@ -14,3 +14,6 @@ npm-debug.log*
 
 # Local autogit config (created when testing autogit on itself)
 .autogit.json
+
+# Private notes for David (never commit)
+notes-for-david.md
