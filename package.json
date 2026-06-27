@@ -1,6 +1,6 @@
 {
   "name": "@davidondrej/autogit",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Auto stage→commit→push for agentic engineers. Works with any coding agent.",
   "author": "David Ondrej",
   "repository": {
@@ -9,6 +9,9 @@
   },
   "bin": {
     "autogit": "index.js"
+  },
+  "scripts": {
+    "test": "node --test"
   },
   "files": [
     "index.js",

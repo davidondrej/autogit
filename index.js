@@ -7,10 +7,11 @@
 //   autogit undo      take back the last autogit commit (local + remote)
 //   autogit status    show hooks + repo state
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, utimesSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, utimesSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
+import { fileURLToPath } from "node:url";
 
 const CONFIG_FILE = ".autogit.json";
 // Version comes from package.json — single source of truth.
@@ -365,13 +366,57 @@ function cmdOff() {
 // While an agent is mid-turn it holds a marker file; ship defers if any other
 // agent's marker is fresh. The last agent to finish ships everything.
 
-const BUSY_TTL_MS = 15 * 60 * 1000; // markers older than this are stale (crashed agent)
+// PID liveness is the primary "is this agent still working?" signal. This TTL is
+// only a backstop: it reaps legacy (pre-pid) markers and guards against a
+// recycled pid that happens to look alive on a marker we never cleaned.
+const BUSY_TTL_MS = 10 * 60 * 1000;
 
 function busyDir(root) {
   // resolve the real git dir — in worktrees, <root>/.git is a file, and each
   // worktree gets its own dir, which isolates busy markers per checkout
   const gd = git("rev-parse", "--git-dir").out; // relative to cwd, or absolute in worktrees
   return path.join(path.resolve(process.cwd(), gd), "autogit-busy");
+}
+
+// The agent is the long-lived process that spawned this hook. Hooks run via a
+// throwaway shell wrapper (`cd … && autogit …`) that exits the instant the hook
+// returns, so our own ppid is that dead shell — useless for liveness. Walk up
+// past shells to the real agent. Verified tree: node → zsh → claude. Pi spawns
+// autogit directly, so its parent is already the agent (a non-shell).
+const SHELL_RE = /(^|\/|-)(sh|bash|zsh|dash|fish|env)$/;
+function agentPid() {
+  let pid = process.ppid;
+  for (let i = 0; i < 6 && pid > 1; i++) {
+    const r = spawnSync("ps", ["-o", "ppid=,comm=", "-p", String(pid)], { encoding: "utf8" });
+    const m = (r.stdout || "").trim().match(/^\s*(\d+)\s+(.*)$/);
+    if (!m) break;
+    if (!SHELL_RE.test(m[2].trim())) return pid; // first non-shell ancestor = the agent
+    pid = parseInt(m[1], 10);
+  }
+  return process.ppid;
+}
+
+// `process.kill(pid, 0)` probes existence without signalling: ESRCH = gone,
+// EPERM = exists but owned by another user (still alive).
+function isAlive(pid) {
+  if (!pid || pid <= 1) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return e.code === "EPERM"; }
+}
+
+// Marker payload = the owning agent's pid + this turn's prompt, as JSON. The pid
+// lets ship tell a live agent from an orphan — a dead process, or our own
+// churned session id (compaction / clear / resume leaves the old marker behind).
+// Legacy markers are bare prompt text; they read back as { pid: null }.
+function writeMarker(file, pid, prompt) {
+  writeFileSync(file, JSON.stringify({ pid: pid || null, prompt: prompt || "" }));
+}
+function readMarker(file) {
+  try {
+    const t = readFileSync(file, "utf8").trim();
+    if (t.startsWith("{")) { const o = JSON.parse(t); return { pid: o.pid || null, prompt: (o.prompt || "").trim() || null }; }
+    return { pid: null, prompt: t || null };
+  } catch { return null; }
 }
 
 function sessionId(payload, args) {
@@ -397,6 +442,7 @@ function cmdBusy(args) {
   const id = sessionId(payload, args);
   if (!id) return; // no session id → no marker: nobody could ever clear it
   const prompt = promptText(payload);
+  const pid = agentPid(); // stamped into the marker so ship can check liveness
   const roots = payload?.workspace_roots?.length ? payload.workspace_roots : [process.cwd()];
   for (const dir of roots) {
     try {
@@ -405,7 +451,7 @@ function cmdBusy(args) {
       if (!root || !existsSync(path.join(root, CONFIG_FILE))) continue; // only opted-in repos
       const marker = markerPath(root, id);
       mkdirSync(path.dirname(marker), { recursive: true });
-      if (prompt || !existsSync(marker)) writeFileSync(marker, prompt || "");
+      if (prompt || !existsSync(marker)) writeMarker(marker, pid, prompt);
       else { const now = new Date(); utimesSync(marker, now, now); } // mtime is the freshness signal
     } catch {}
   }
@@ -416,24 +462,37 @@ function takeOwnMarker(root, id) {
   if (!id) return null;
   try {
     const p = markerPath(root, id);
-    const prompt = readFileSync(p, "utf8").trim();
+    const m = readMarker(p);
     unlinkSync(p);
-    return prompt || null;
+    return m?.prompt || null;
   } catch { return null; }
 }
 
-// Returns true if another agent is mid-turn in this repo. Cleans stale markers.
-function othersBusy(root) {
+// Sweep every marker (no early return) and delete the ones that can't represent
+// a live *other* agent:
+//   • mine    — owned by THIS agent's pid: a leftover from our own churned
+//               session id (compaction / clear / resume). Same process = it's us.
+//   • dead    — owned by a process that no longer exists (crashed / closed agent).
+//   • stale   — past the TTL backstop (covers legacy pid-less markers & pid reuse).
+// Returns true only if a marker from a live, *different* agent survives — the one
+// case where deferring is correct.
+function sweepBusy(root, myPid) {
   const dir = busyDir(root);
   if (!existsSync(dir)) return false;
+  let othersLive = false;
   for (const f of readdirSync(dir)) {
     const p = path.join(dir, f);
     try {
-      if (Date.now() - statSync(p).mtimeMs > BUSY_TTL_MS) { unlinkSync(p); continue; }
-      return true;
+      const stale = Date.now() - statSync(p).mtimeMs > BUSY_TTL_MS;
+      const m = readMarker(p);
+      const pid = m?.pid || null;
+      const mine = pid && myPid && pid === myPid;
+      const dead = pid != null && !isAlive(pid);
+      if (stale || mine || dead) { unlinkSync(p); continue; }
+      othersLive = true;
     } catch {}
   }
-  return false;
+  return othersLive;
 }
 
 // ---------- ship ----------
@@ -520,8 +579,10 @@ function shipRepo(dir, args, id, payload) {
   // clear our own marker first — it may hold this turn's prompt
   const storedPrompt = takeOwnMarker(root, id);
 
-  // another agent mid-turn? defer — the last one to finish ships everything
-  if (othersBusy(root)) {
+  // another agent mid-turn? defer — the last one to finish ships everything.
+  // sweepBusy also reaps our own orphaned markers (churned session id) and any
+  // left by dead agents, so a ghost can no longer block shipping for the full TTL.
+  if (sweepBusy(root, agentPid())) {
     console.error("autogit: deferred — another agent is still working in this repo.");
     return;
   }
@@ -665,14 +726,29 @@ function cmdStatus() {
   console.log(`        auto-push ${on ? "ON" : "OFF — run: autogit on"}${acct.ok && acct.out ? ` · pushes as ${acct.out}` : ""}`);
 
   const dir = busyDir(root);
-  const fresh = existsSync(dir)
-    ? readdirSync(dir).filter(f => Date.now() - statSync(path.join(dir, f)).mtimeMs <= BUSY_TTL_MS)
+  // count only live agents — a marker whose process is gone is a ghost, not busy
+  const live = existsSync(dir)
+    ? readdirSync(dir).filter(f => {
+        try {
+          const p = path.join(dir, f);
+          if (Date.now() - statSync(p).mtimeMs > BUSY_TTL_MS) return false;
+          const m = readMarker(p);
+          return m?.pid == null || isAlive(m.pid); // legacy: trust TTL; else require a live process
+        } catch { return false; }
+      })
     : [];
-  if (fresh.length) console.log(`        busy: ${fresh.length} agent(s) mid-turn — shipping deferred`);
+  if (live.length) console.log(`        busy: ${live.length} agent(s) mid-turn — shipping deferred`);
 }
 
 // ---------- main ----------
 
+// Only run the CLI when executed directly (not when imported by tests). realpath
+// resolves the npm-link symlink so `autogit` still matches this real file.
+let isMain = false;
+try { isMain = !!process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url); }
+catch { isMain = false; }
+
+if (isMain) {
 const [cmd, ...args] = process.argv.slice(2);
 switch (cmd) {
   case "setup": cmdSetup(); break;
@@ -706,3 +782,7 @@ ship flags:
 Parallel agents in one repo: ship defers while another agent is mid-turn;
 the last one to finish ships everything. Use worktrees for full isolation.`);
 }
+}
+
+// Exported for tests (importing this file is a no-op thanks to the isMain guard).
+export { agentPid, isAlive, writeMarker, readMarker, takeOwnMarker, sweepBusy, busyDir, markerPath, BUSY_TTL_MS };
