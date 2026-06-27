@@ -476,23 +476,27 @@ function takeOwnMarker(root, id) {
 //   • stale   — past the TTL backstop (covers legacy pid-less markers & pid reuse).
 // Returns true only if a marker from a live, *different* agent survives — the one
 // case where deferring is correct.
-function sweepBusy(root, myPid) {
+function sweepBusyMarkers(root, myPid, { reapMine = true } = {}) {
   const dir = busyDir(root);
-  if (!existsSync(dir)) return false;
-  let othersLive = false;
+  if (!existsSync(dir)) return 0;
+  let live = 0;
   for (const f of readdirSync(dir)) {
     const p = path.join(dir, f);
     try {
       const stale = Date.now() - statSync(p).mtimeMs > BUSY_TTL_MS;
       const m = readMarker(p);
       const pid = m?.pid || null;
-      const mine = pid && myPid && pid === myPid;
+      const mine = reapMine && pid && myPid && pid === myPid;
       const dead = pid != null && !isAlive(pid);
       if (stale || mine || dead) { unlinkSync(p); continue; }
-      othersLive = true;
+      live++;
     } catch {}
   }
-  return othersLive;
+  return live;
+}
+
+function sweepBusy(root, myPid) {
+  return sweepBusyMarkers(root, myPid) > 0;
 }
 
 // ---------- ship ----------
@@ -725,19 +729,10 @@ function cmdStatus() {
   console.log(`repo:   ${root}`);
   console.log(`        auto-push ${on ? "ON" : "OFF — run: autogit on"}${acct.ok && acct.out ? ` · pushes as ${acct.out}` : ""}`);
 
-  const dir = busyDir(root);
-  // count only live agents — a marker whose process is gone is a ghost, not busy
-  const live = existsSync(dir)
-    ? readdirSync(dir).filter(f => {
-        try {
-          const p = path.join(dir, f);
-          if (Date.now() - statSync(p).mtimeMs > BUSY_TTL_MS) return false;
-          const m = readMarker(p);
-          return m?.pid == null || isAlive(m.pid); // legacy: trust TTL; else require a live process
-        } catch { return false; }
-      })
-    : [];
-  if (live.length) console.log(`        busy: ${live.length} agent(s) mid-turn — shipping deferred`);
+  // Reuse the same sweep as ship so status cleans stale/dead ghosts too. Do not
+  // reap same-pid markers here: status may be called mid-turn by that agent.
+  const live = sweepBusyMarkers(root, null, { reapMine: false });
+  if (live) console.log(`        busy: ${live} agent(s) mid-turn — shipping deferred`);
 }
 
 // ---------- main ----------
@@ -785,4 +780,4 @@ the last one to finish ships everything. Use worktrees for full isolation.`);
 }
 
 // Exported for tests (importing this file is a no-op thanks to the isMain guard).
-export { agentPid, isAlive, writeMarker, readMarker, takeOwnMarker, sweepBusy, busyDir, markerPath, BUSY_TTL_MS };
+export { agentPid, isAlive, writeMarker, readMarker, takeOwnMarker, sweepBusy, sweepBusyMarkers, busyDir, markerPath, BUSY_TTL_MS };

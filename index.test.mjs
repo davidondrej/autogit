@@ -7,7 +7,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, utimesSync, existsSync, rmSync }
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { sweepBusy, busyDir, isAlive, agentPid, readMarker, writeMarker, BUSY_TTL_MS } from "./index.js";
+import { sweepBusy, sweepBusyMarkers, busyDir, isAlive, agentPid, readMarker, writeMarker, BUSY_TTL_MS } from "./index.js";
 
 // A pid astronomically unlikely to exist — stands in for a crashed/closed agent.
 const DEAD_PID = 2147480000;
@@ -95,6 +95,20 @@ test("multiple markers are all swept in one pass (no early return)", () => {
     assert.equal(existsSync(marker(dir, "mine")), false, "self-orphan reaped");
     assert.equal(existsSync(staleF), false, "stale reaped");
     assert.equal(existsSync(liveOther), true, "live other preserved");
+  });
+});
+
+test("status-style sweep cleans ghosts while preserving live markers", () => {
+  inRepo(dir => {
+    writeMarker(marker(dir, "dead"), DEAD_PID, "a");
+    const liveOther = marker(dir, "live-other");
+    writeMarker(liveOther, process.pid, "b");
+    const staleF = marker(dir, "stale");
+    writeMarker(staleF, process.pid, "c"); age(staleF, BUSY_TTL_MS + 60_000);
+    assert.equal(sweepBusyMarkers(dir, null, { reapMine: false }), 1, "only the live marker counts");
+    assert.equal(existsSync(marker(dir, "dead")), false, "dead reaped");
+    assert.equal(existsSync(staleF), false, "stale reaped");
+    assert.equal(existsSync(liveOther), true, "live marker preserved");
   });
 });
 
