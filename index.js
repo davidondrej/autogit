@@ -44,7 +44,7 @@ const SECRET_PATTERNS = [
   { name: "AWS access key", re: /AKIA[0-9A-Z]{16}/ },
   { name: "Private key block", re: /-----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/ },
   { name: "Generic API key assignment", re: /(api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token)["']?\s*[:=]\s*["'][A-Za-z0-9_\-]{20,}["']/i },
-  { name: "OpenAI key", re: /sk-[A-Za-z0-9_\-]{20,}/ },
+  { name: "OpenAI key", re: /\bsk-[A-Za-z0-9_\-]{20,}/ },
   { name: "Anthropic key", re: /sk-ant-[A-Za-z0-9_\-]{20,}/ },
   { name: "GitHub token", re: /gh[pousr]_[A-Za-z0-9]{36,}/ },
   { name: "Slack token", re: /xox[baprs]-[A-Za-z0-9\-]{10,}/ },
