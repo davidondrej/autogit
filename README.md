@@ -49,6 +49,8 @@ autogit --version Print the installed version (-v)
 
 **Undo**: shipped something you regret? `autogit undo` rewinds the remote branch, removes the commit locally, and leaves the changes uncommitted in your working tree — ready to fix and re-ship. Run it again to peel off earlier autogit commits. It refuses to touch commits it didn't make, or remotes that have since moved on.
 
+**Status**: `autogit status` reports the version, which agent hooks are wired, whether auto-push is on here, and a busy line. `busy: N agent(s) mid-turn — shipping deferred` means another agent is still active in this repo, so your change is staged-pending — **not** lost or failed; the last agent to finish ships everything. If something hasn't pushed yet, check here first: a deferred ship during concurrent agents is normal, not a bug.
+
 ## Safety
 
 - **Opt-in per repo** — repos without `autogit on` are never touched.
