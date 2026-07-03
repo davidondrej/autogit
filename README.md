@@ -57,7 +57,7 @@ autogit --version Print the installed version (-v)
 - **Public-repo check** — `autogit on` warns when the repo is public on GitHub (your prompts become public commit messages). Humans confirm with y/N; agents must re-run with `autogit on --public-ok`.
 - **Multi-account aware** — if `gh` has several GitHub accounts logged in, `autogit on` asks which one pushes this repo and pins it (repo-local git config). Agents pass `--account <name>`.
 - **One-command undo** — `autogit undo` takes back the last auto-push, remote included.
-- **Secrets scan** — blocks pushes containing API keys, private key blocks, `.env` files, or JWTs, and unstages everything. Override with `--force-secrets`. Commit messages are covered too: a prompt containing a secret never becomes the subject (not overridable).
+- **Secrets scan** — blocks pushes containing API keys, private key blocks, `.env` files, or JWTs, and unstages everything. Template files (`.env.example`, `*.sample`, `*.template`, `*.dist`) and obvious placeholder values (`your-key-here`, `AKIA…EXAMPLE`, `xxxx…`) are exempt — they're meant to be committed. Override real blocks with `--force-secrets`. Commit messages are covered too: a prompt containing a secret never becomes the subject (not overridable).
 - **No noise** — nothing changed means nothing shipped. Aborted or errored Cursor turns never ship.
 - **Remote-moved aware** — if something else pushed first (another machine, the GitHub web editor), `ship` rebases your commit onto the new remote tip and retries. Real conflicts stop safely: commit kept locally, fix spelled out.
 - **Parallel-agent aware** — if another agent is still mid-task in the same repo, autogit waits its turn: the last agent to finish ships everything. (For fully separate commits per agent, use worktrees — autogit handles each independently.)
@@ -83,6 +83,8 @@ For contributors, human or AI. The implementation is a reference of product inte
 ### How `ship` works
 
 `git add -A` → secrets scan on added lines (AWS/OpenAI/Anthropic/GitHub/Slack/Google keys, private key blocks, `.env` filenames, JWTs; `--force-secrets` overrides) → commit → push to `origin`/current branch.
+
+Scan false-positive guards (added 2026-07-03, after every-turn blocks in the field): filenames ending `.example`/`.sample`/`.template`/`.dist` skip the sensitive-filename check (contents still scanned), and a matched token containing an obvious placeholder word (`your`, `example`, `changeme`, `xxxx`, …) is ignored — the placeholder test runs against the matched token only, never the whole line, so a real key on a line mentioning "example" still blocks. Note a blocked file stays in the working tree: `git add -A` re-stages it next turn, so a real stray `.env` re-blocks every turn until removed or gitignored (the error message says so).
 
 Non-fast-forward rejection (remote moved — a push from elsewhere) self-heals: fetch, `git rebase FETCH_HEAD`, push again once. The tree is always clean at that point (everything was just committed) so the rebase is safe, and the `Shipped-by` trailer survives it, so `undo` keeps working. A rebase conflict aborts cleanly: commit kept locally, manual fix printed (`git pull --rebase && git push`). Any other push failure still dies with the commit kept locally.
 

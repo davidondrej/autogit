@@ -54,6 +54,15 @@ const SECRET_PATTERNS = [
 ];
 
 const SENSITIVE_FILES = [/^\.env(\..+)?$/, /\.pem$/, /\.key$/, /id_rsa/, /credentials\.json$/];
+// Template/placeholder files (.env.example, config.key.template, …) are meant
+// to be committed — exempt them from the filename check. Contents still get
+// the added-line scan, so a real key pasted into a template is still caught.
+const TEMPLATE_FILE = /\.(example|sample|template|dist)$/i;
+// Obvious placeholder values (docs, templates, sample configs) aren't secrets.
+// Tested against the matched token only — never the whole line — so a real key
+// on a line that merely mentions "example" is still caught. A genuine key
+// containing one of these words is possible but astronomically unlikely.
+const PLACEHOLDER = /your|example|sample|placeholder|changeme|dummy|redacted|xxxx|1234567890/i;
 
 // Prompts can carry pasted secrets — those must never become commit subjects.
 // Checks the full text (not the truncated subject) so a key cut off at 72
@@ -67,7 +76,9 @@ function scanSecrets() {
   const staged = git("diff", "--cached", "--name-only").out.split("\n").filter(Boolean);
 
   for (const f of staged) {
-    if (SENSITIVE_FILES.some(re => re.test(path.basename(f)))) {
+    const base = path.basename(f);
+    if (TEMPLATE_FILE.test(base)) continue;
+    if (SENSITIVE_FILES.some(re => re.test(base))) {
       findings.push({ file: f, issue: "sensitive filename" });
     }
   }
@@ -78,7 +89,8 @@ function scanSecrets() {
     if (line.startsWith("+++ b/")) { currentFile = line.slice(6); continue; }
     if (!line.startsWith("+") || line.startsWith("+++")) continue;
     for (const { name, re } of SECRET_PATTERNS) {
-      if (re.test(line)) findings.push({ file: currentFile, issue: name });
+      const m = line.match(re);
+      if (m && !PLACEHOLDER.test(m[0])) findings.push({ file: currentFile, issue: name });
     }
   }
   return findings;
@@ -612,7 +624,7 @@ function shipRepo(dir, args, id, payload) {
       git("reset");
       console.error("✗ autogit: blocked — possible secrets in the diff:");
       for (const f of findings) console.error(`    ${f.file}: ${f.issue}`);
-      die("fix these, or rerun with --force-secrets.");
+      die("remove the secrets, .gitignore the files, or rerun with --force-secrets.");
     }
   }
 
