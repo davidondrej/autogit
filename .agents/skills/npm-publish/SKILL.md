@@ -39,6 +39,14 @@ npm login
 Flow: prints a login URL, then waits at "Press ENTER to open in the browser..." — press ENTER. It opens a tab in Brave; David auths with his Apple passkey (fingerprint) — takes seconds. Terminal prints "Logged in on https://registry.npmjs.org/." when done. Then publish again.
 Check who's logged in: `npm whoami`.
 
+## The full happy path (verified 2026-07-03, publishing 0.7.2)
+
+1. `npm publish --access=public`
+2. Publish pauses → press ENTER → Brave opens → Apple passkey (fingerprint) → publish finishes (`+ @davidondrej/autogit@x.y.z`)
+3. Verify: `npm view @davidondrej/autogit version`
+
+Total time when auth is fresh: ~30 seconds. Two passkey touches max (login + publish).
+
 ## Log of past incidents
 
-- 2026-07-03: publishing 0.7.2 hit E404 on PUT — auth token was stale. Re-auth via `npm login` was the fix path.
+- 2026-07-03: publishing 0.7.2 hit E404 on PUT — auth token was stale. `npm login` fixed it (browser + passkey), then publish worked but paused for its own browser passkey confirmation. E404 = re-auth, nothing else.
