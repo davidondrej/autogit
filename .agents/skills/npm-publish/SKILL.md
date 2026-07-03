@@ -36,7 +36,7 @@ npm view @davidondrej/autogit version
 npm login
 ```
 
-Opens a browser; log in as `davidondrej`, approve, then publish again.
+Flow: prints a login URL, then waits at "Press ENTER to open in the browser..." — press ENTER, finish the login in the browser (user `davidondrej`), and wait for the terminal to print "Logged in". Then publish again.
 Check who's logged in: `npm whoami`.
 
 ## Log of past incidents
