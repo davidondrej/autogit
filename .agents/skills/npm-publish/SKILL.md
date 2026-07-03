@@ -36,7 +36,7 @@ npm view @davidondrej/autogit version
 npm login
 ```
 
-Flow: prints a login URL, then waits at "Press ENTER to open in the browser..." — press ENTER, finish the login in the browser (user `davidondrej`), and wait for the terminal to print "Logged in". Then publish again.
+Flow: prints a login URL, then waits at "Press ENTER to open in the browser..." — press ENTER. It opens a tab in Brave; David auths with his Apple passkey (fingerprint) — takes seconds. Terminal prints "Logged in on https://registry.npmjs.org/." when done. Then publish again.
 Check who's logged in: `npm whoami`.
 
 ## Log of past incidents
