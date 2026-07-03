@@ -13,22 +13,34 @@ description: Help David publish @davidondrej/autogit to npm as fast as possible.
 - npm 2FA is on: publish itself pauses at "Authenticate your account at <url> / Press ENTER to open in the browser..." — press ENTER, confirm with the Apple passkey (fingerprint) in Brave, publish continues. (No terminal OTP anymore.)
 - Give ONE command at a time. Very concise. No explanations unless something failed.
 
-## Fast path
+## What to send David (use this exact format)
 
-```bash
-npm publish --access=public
-```
+When a release is ready, send him this — each command in its own code block, one super-concise instruction line above each. Nothing more.
 
-Verify after:
+> Publish (when it pauses: ENTER → passkey in Brave):
+>
+> ```bash
+> npm publish --access=public
+> ```
+>
+> Then verify it's live:
+>
+> ```bash
+> npm view @davidondrej/autogit version
+> ```
 
-```bash
-npm view @davidondrej/autogit version
-```
+Only if publish fails with E404 (stale auth), send:
+
+> Re-auth (ENTER → passkey in Brave), then publish again:
+>
+> ```bash
+> npm login
+> ```
 
 ## Known failures → fixes
 
 - **E404 on PUT** (`could not be found or you do not have permission`) — stale/invalid auth token. The package exists; npm hides permission errors as 404. Fix: re-auth (below), then publish again.
-- **EOTP** — missing/expired one-time password. Rerun publish, enter a fresh authenticator code.
+- **EOTP** — missing/expired one-time password (legacy; 2FA is browser-passkey now). Rerun publish and complete the browser auth.
 
 ## Re-auth
 
