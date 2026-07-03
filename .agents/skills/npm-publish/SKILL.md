@@ -10,7 +10,7 @@ description: Help David publish @davidondrej/autogit to npm as fast as possible.
 - David is ALWAYS already in the right folder. NEVER tell him to `cd`.
 - Agents NEVER run `npm publish` themselves (2FA; AGENTS.md rule). Give David the exact command in a code block.
 - Scoped package → `--access=public` is required.
-- npm 2FA is on: publish asks for an authenticator OTP in the terminal.
+- npm 2FA is on: publish itself pauses at "Authenticate your account at <url> / Press ENTER to open in the browser..." — press ENTER, confirm with the Apple passkey (fingerprint) in Brave, publish continues. (No terminal OTP anymore.)
 - Give ONE command at a time. Very concise. No explanations unless something failed.
 
 ## Fast path
