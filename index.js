@@ -55,8 +55,11 @@ const SECRET_PATTERNS = [
 
 const SENSITIVE_FILES = [/^\.env(\..+)?$/, /\.pem$/, /\.key$/, /id_rsa/, /credentials\.json$/];
 // Template/placeholder files (.env.example, config.key.template, …) are meant
-// to be committed — exempt them from the filename check. Contents still get
-// the added-line scan, so a real key pasted into a template is still caught.
+// to be committed — skip them entirely: filename check AND content scan. A
+// realistic-looking dummy value is indistinguishable from a real key, so
+// scanning template contents only produces false positives that block every
+// turn. Deliberate trade-off: a real key pasted into a template ships —
+// naming a file *.example declares its contents committable.
 const TEMPLATE_FILE = /\.(example|sample|template|dist)$/i;
 // Obvious placeholder values (docs, templates, sample configs) aren't secrets.
 // Tested against the matched token only — never the whole line — so a real key
@@ -83,11 +86,15 @@ function scanSecrets() {
     }
   }
 
-  // only scan added lines
-  let currentFile = "";
+  // only scan added lines; template files are skipped wholesale (see above)
+  let currentFile = "", inTemplate = false;
   for (const line of git("diff", "--cached", "--unified=0").out.split("\n")) {
-    if (line.startsWith("+++ b/")) { currentFile = line.slice(6); continue; }
-    if (!line.startsWith("+") || line.startsWith("+++")) continue;
+    if (line.startsWith("+++ b/")) {
+      currentFile = line.slice(6);
+      inTemplate = TEMPLATE_FILE.test(path.basename(currentFile));
+      continue;
+    }
+    if (inTemplate || !line.startsWith("+") || line.startsWith("+++")) continue;
     for (const { name, re } of SECRET_PATTERNS) {
       const m = line.match(re);
       if (m && !PLACEHOLDER.test(m[0])) findings.push({ file: currentFile, issue: name });

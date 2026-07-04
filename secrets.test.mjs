@@ -53,6 +53,14 @@ test(".env.example ships — template files are not secrets (the every-turn bloc
   assert.match(r.err, /shipped/);
 });
 
+test("realistic-looking dummy values in template files ship — templates are exempt, contents included", () => {
+  // key built at runtime so this source file never contains a scannable token
+  const fakeKey = "sk-" + "AbCdEfGhIjKlMnOpQrStUvWx";
+  const r = ship({ ".env.example": `OPENAI_API_KEY=${fakeKey}\n` });
+  assert.equal(r.code, 0, r.err);
+  assert.equal(r.pushed, 2, "the commit should reach origin");
+});
+
 test("a real .env still blocks, and unstages everything", () => {
   const r = ship({ ".env": "OPENAI_API_KEY=real\n", "app.js": "ok\n" });
   assert.equal(r.code, 1);
