@@ -42,12 +42,15 @@ autogit off       Disable auto-push in this repo
 autogit ship      Stage, scan, commit, push (what the hooks run)
 autogit undo      Take back the last autogit commit, local + remote
 autogit status    Show hooks + repo state
+autogit update    Update autogit to the latest version from npm
 autogit --version Print the installed version (-v)
 ```
 
 **Commit messages**: `autogit ship -m "message"` uses your message. Without `-m`, the subject is the prompt you gave your agent that turn (so `git log` reads like your instructions), falling back to a list of changed files. If the prompt looks like it contains a secret (pasted API key, token, etc.), it's never used — the commit gets the file-list subject instead.
 
 **Undo**: shipped something you regret? `autogit undo` rewinds the remote branch, removes the commit locally, and leaves the changes uncommitted in your working tree — ready to fix and re-ship. Run it again to peel off earlier autogit commits. It refuses to touch commits it didn't make, or remotes that have since moved on.
+
+**Update**: `autogit update` fetches the latest release (`npm install -g` under the hood) and prints old → new version. Running from a source checkout (`npm link`)? It refuses and points you at `git pull` instead.
 
 **Status**: `autogit status` reports the version, which agent hooks are wired, whether auto-push is on here, and a busy line. `busy: N agent(s) mid-turn — shipping deferred` means another agent is still active in this repo, so your change is staged-pending — **not** lost or failed; the last agent to finish ships everything. If something hasn't pushed yet, check here first: a deferred ship during concurrent agents is normal, not a bug.
 
@@ -69,7 +72,8 @@ For contributors, human or AI. The implementation is a reference of product inte
 ### Design
 
 - Single zero-dependency Node.js CLI: `index.js`, ESM, Node ≥18.
-- Commands: `setup`, `on`, `off`, `ship`, `undo`, `busy`, `status`, plus `-v`/`--version` (read from `package.json`, also shown by `status`).
+- Commands: `setup`, `on`, `off`, `ship`, `undo`, `busy`, `status`, `update`, plus `-v`/`--version` (read from `package.json`, also shown by `status`).
+- `autogit update` (added 2026-07-04, after users couldn't find how to update): runs `npm install -g @davidondrej/autogit@latest`, then reports old → new by asking the fresh binary for its version (the running process is still old code). Source checkouts refuse with a `git pull` hint — detected by `.git` next to `index.js` (npm strips it on publish) — so npm can't bury an `npm link` symlink under the registry tarball.
 - One mode for now (DECIDED 2026-06-10): **auto** — ship immediately, no review gate. Review modes are on the roadmap.
 - npm name (DECIDED 2026-06-10): **`@davidondrej/autogit`** — unscoped `autogit`/`autogit-cli` taken; `auto-git` rejected by npm's name-similarity rule. The installed binary stays `autogit`. Scoped packages need `npm publish --access=public`.
 - Per-repo opt-in is the safety model: `autogit on` writes `.autogit.json`; without it, `ship` is a silent no-op (exit 0). Only enable it where aggressive auto-push is OK.

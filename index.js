@@ -6,6 +6,7 @@
 //   autogit ship      stage, scan, commit, push (what the hooks run)
 //   autogit undo      take back the last autogit commit (local + remote)
 //   autogit status    show hooks + repo state
+//   autogit update    update autogit to the latest version from npm
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, utimesSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
@@ -728,6 +729,29 @@ function cmdUndo() {
   ok(`undid "${subject}" — changes are back (uncommitted) in your working tree.`);
 }
 
+// ---------- update ----------
+// Self-update: `npm install -g` isn't discoverable from inside the tool, so
+// users on old versions stayed stuck (seen in the field). One command fixes it.
+
+function cmdUpdate() {
+  // Source checkouts (git clone + npm link) must not be npm-installed over —
+  // the registry tarball would bury the live repo behind the symlink. npm
+  // strips .git on publish, so its presence next to index.js means "source".
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  if (existsSync(path.join(here, ".git")))
+    die(`running from a source checkout (${here}) — update with git pull.`);
+  console.error(`autogit: ${VERSION} installed — updating from npm…`);
+  // npm's output stays visible, but on stderr like everything autogit prints
+  const r = spawnSync("npm", ["install", "-g", "@davidondrej/autogit@latest"], { stdio: ["ignore", 2, 2] });
+  if (r.error) die("npm not found on PATH — install Node.js/npm and rerun.");
+  if (r.status !== 0) die("update failed — see npm's output above.");
+  // this process is still the old code — ask the fresh install for its version
+  const now = (spawnSync("autogit", ["--version"], { encoding: "utf8" }).stdout || "").trim();
+  if (now === VERSION) ok(`already up to date (${VERSION}).`);
+  else if (now) ok(`updated ${VERSION} → ${now}.`);
+  else ok("updated — check with: autogit --version");
+}
+
 // ---------- status ----------
 
 function cmdStatus() {
@@ -772,6 +796,7 @@ switch (cmd) {
   case "undo": cmdUndo(); break;
   case "busy": cmdBusy(args); break;
   case "status": cmdStatus(); break;
+  case "update": cmdUpdate(); break;
   case "-v": case "--version": console.log(VERSION); break;
   default:
     console.log(`autogit — auto stage→commit→push for agentic engineers
@@ -783,6 +808,7 @@ switch (cmd) {
   autogit undo      Take back the last autogit commit, local + remote (repeatable)
   autogit busy      Mark this repo busy (agent start/tool hooks run this)
   autogit status    Show hooks + repo state
+  autogit update    Update autogit to the latest version from npm
   autogit --version Print the installed version (-v)
 
 on flags:
