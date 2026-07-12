@@ -8,7 +8,7 @@
 //   autogit status    show hooks + repo state
 //   autogit update    update autogit to the latest version from npm
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, utimesSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, utimesSync, realpathSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -358,9 +358,12 @@ async function cmdOn(args) {
   if (!root) die("not inside a git repository.");
   const p = path.join(root, CONFIG_FILE);
   if (existsSync(p)) {
-    // already on — but `--account` re-pins without toggling
+    // already on — flags still work without toggling: --account re-pins,
+    // --agent / --auto switch the mode in place
     if (args.includes("--account")) await chooseAccount(args);
-    else ok("already on.");
+    if (args.includes("--agent")) await enableAgentMode(p, args);
+    else if (args.includes("--auto")) { updateRepoConfig(p, { mode: "auto" }); ok("agent mode OFF — back to plain auto-push."); }
+    else if (!args.includes("--account")) ok("already on.");
     return;
   }
   const remote = git("remote", "get-url", "origin");
@@ -369,6 +372,7 @@ async function cmdOn(args) {
   if (slug && !args.includes("--public-ok") && await isPublicOnGitHub(slug)) await confirmPublic(slug);
   // account pin only applies to HTTPS github remotes — SSH routes by key
   if (slug && /^https?:\/\//.test(url)) await chooseAccount(args);
+  if (args.includes("--agent")) { await enableAgentMode(p, args); return; }
   writeFileSync(p, JSON.stringify({ mode: "auto" }, null, 2) + "\n");
   ok(`auto-push ON — every agent turn in this repo now ships to git.`);
 }
@@ -519,6 +523,222 @@ function sweepBusy(root, myPid) {
   return sweepBusyMarkers(root, myPid) > 0;
 }
 
+// ---------- agent mode (LLM commit gate) ----------
+// mode "agent": before committing, one LLM call reviews the turn's staged diff
+// and decides ship-vs-hold, plus writes a descriptive commit subject.
+// DECIDED 2026-07-12: a separate OpenRouter call, superseding the 2026-06-09
+// running-agent idea — no agent exposes a review channel from a stop hook (the
+// turn is already over), and one API call works uniformly for all four agents.
+// The turn's prompt is sent along with the diff, recovering most task context.
+// Fail open everywhere: no key, timeout, HTTP error, unparseable reply → ship
+// with plain auto behavior. autogit is a backup as much as a publisher — a
+// flaky API must never silently stop pushes. Held changes stay in the working
+// tree; next turn's `git add -A` re-stages them and the agent re-decides.
+
+const OPENROUTER_URL = "https://openrouter.ai/api/v1";
+const DEFAULT_MODEL = "google/gemini-2.5-flash-lite"; // cheap + fast; override with --model or global config
+const AGENT_TIMEOUT_MS = 15_000; // hooks have their own ~60s timeouts — stay well under
+const MAX_DIFF_CHARS = 50_000;   // huge turns send a truncated diff, not a blown context
+
+// The key lives machine-global, never in the repo — .autogit.json is often
+// committed. AUTOGIT_HOME is honored so tests (and dotfile setups) can relocate it.
+function globalConfigFile() {
+  return path.join(process.env.AUTOGIT_HOME || homedir(), ".autogit", "config.json");
+}
+
+function readGlobalConfig() {
+  try { return JSON.parse(readFileSync(globalConfigFile(), "utf8")); } catch { return {}; }
+}
+
+// The config holds a secret — 0600 on create, and chmod for pre-existing files.
+function writeGlobalConfig(cfg) {
+  const file = globalConfigFile();
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
+  try { chmodSync(file, 0o600); } catch {}
+}
+
+// Key: env var wins (CI, one-offs), then the global config. Model precedence:
+// repo .autogit.json > global config > built-in default. baseUrl is global-only —
+// any OpenAI-compatible endpoint works (LiteLLM, a proxy, …).
+function agentSettings(repoCfg) {
+  const g = readGlobalConfig();
+  return {
+    key: process.env.OPENROUTER_API_KEY || g.openrouterApiKey || null,
+    model: repoCfg?.model || g.model || DEFAULT_MODEL,
+    baseUrl: (g.baseUrl || OPENROUTER_URL).replace(/\/+$/, "")
+  };
+}
+
+// Ship-vs-hold policy. Bias to ship: held work exists only on this machine.
+const AGENT_SYSTEM_PROMPT = `You are the commit gate for autogit, a tool that auto-commits and auto-pushes after every AI coding-agent turn. Review one turn's staged changes and decide: ship them now, or hold them for a later turn.
+
+HOLD only when shipping now would clearly hurt:
+- work in progress — half-implemented features, broken or unfinished code that later turns will complete
+- meaningless churn — debug prints, scratch/temp files, commented-out experiments, accidental edits that add nothing on their own
+
+SHIP everything else, including small but complete changes (a typo fix, a doc tweak). When unsure, ship: autogit is also a backup — held work exists only on this machine, and held changes are re-reviewed next turn anyway.
+
+Reply with ONLY this JSON (no markdown, no commentary):
+{"commit": true or false, "reason": "short user-facing reason for your decision", "message": "commit subject"}
+
+The message must describe what actually changed and why, from the diff — imperative mood, specific, max 72 characters. Never restate the user's prompt or say "update files". Always fill in message, even when holding.`;
+
+function capDiff(diff) {
+  if (diff.length <= MAX_DIFF_CHARS) return diff;
+  return diff.slice(0, MAX_DIFF_CHARS)
+    + `\n[diff truncated — showing ${MAX_DIFF_CHARS} of ${diff.length} chars]`;
+}
+
+function buildReviewRequest({ prompt, nameStatus, diff, recent }) {
+  return [
+    `User's prompt for this turn:\n${prompt || "(not captured)"}`,
+    recent ? `Recent commit subjects (style reference):\n${recent}` : null,
+    `Staged files:\n${nameStatus}`,
+    `Staged diff:\n${capDiff(diff)}`
+  ].filter(Boolean).join("\n\n");
+}
+
+// Models wrap JSON in fences or prose no matter what you ask — dig out the
+// object and validate the one field that matters. Unparseable → null → fail open.
+function parseDecision(text) {
+  const m = String(text ?? "").match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try {
+    const o = JSON.parse(m[0]);
+    if (typeof o.commit !== "boolean") return null;
+    return {
+      commit: o.commit,
+      reason: typeof o.reason === "string" ? o.reason.trim() : "",
+      message: typeof o.message === "string" ? o.message.trim().replace(/^["'`]+|["'`]+$/g, "") : ""
+    };
+  } catch { return null; }
+}
+
+// One chat-completions call. No response_format: support varies per model, and
+// defensive parsing covers every model. Throws with a short reason on any
+// failure — the caller turns that into a fail-open note.
+async function agentDecide(settings, review) {
+  let res;
+  try {
+    res = await fetch(`${settings.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${settings.key}`,
+        "Content-Type": "application/json",
+        // OpenRouter attribution headers (optional, ignored elsewhere)
+        "HTTP-Referer": "https://github.com/davidondrej/autogit",
+        "X-Title": "autogit"
+      },
+      body: JSON.stringify({
+        model: settings.model,
+        messages: [
+          { role: "system", content: AGENT_SYSTEM_PROMPT },
+          { role: "user", content: review }
+        ]
+      }),
+      signal: AbortSignal.timeout(AGENT_TIMEOUT_MS)
+    });
+  } catch (e) {
+    throw new Error(e.name === "TimeoutError" ? `no reply in ${AGENT_TIMEOUT_MS / 1000}s` : "network error");
+  }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  let content;
+  try { content = (await res.json())?.choices?.[0]?.message?.content; } catch {}
+  const decision = parseDecision(content);
+  if (!decision) throw new Error("unusable reply");
+  return decision;
+}
+
+// The gate ship consults. Returns { hold: reason } (don't commit),
+// { subject } (commit with the LLM's message), or { subject: null }
+// (review unavailable — fail open to the normal subject chain).
+async function agentGate(prompt, repoCfg) {
+  const settings = agentSettings(repoCfg);
+  if (!settings.key) {
+    console.error("autogit: agent mode has no OpenRouter key (run: autogit on --agent) — shipping without review.");
+    return { subject: null };
+  }
+  try {
+    const log = git("log", "-5", "--format=%s");
+    const review = buildReviewRequest({
+      prompt,
+      nameStatus: git("diff", "--cached", "--name-status").out,
+      diff: git("diff", "--cached").out,
+      recent: log.ok ? log.out : ""
+    });
+    const d = await agentDecide(settings, review);
+    if (!d.commit) return { hold: d.reason || "not ready to ship" };
+    return { subject: d.message ? subjectFrom(d.message) : null };
+  } catch (e) {
+    console.error(`autogit: agent review unavailable (${e.message}) — shipping without it.`);
+    return { subject: null };
+  }
+}
+
+// -- agent-mode setup (the `on --agent` path) --
+
+// Best-effort key probe, same spirit as the public-repo check: a definitive
+// 401/403 fails while the human is present to fix it; network trouble passes —
+// being offline must never block setup.
+async function keyLooksValid(key, baseUrl) {
+  try {
+    const res = await fetch(`${baseUrl}/key`, {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(5000)
+    });
+    return res.status !== 401 && res.status !== 403;
+  } catch { return true; }
+}
+
+async function saveKey(key, baseUrl) {
+  if (!(await keyLooksValid(key, baseUrl)))
+    die("OpenRouter rejected that key — check it at https://openrouter.ai/keys and rerun.");
+  writeGlobalConfig({ ...readGlobalConfig(), openrouterApiKey: key });
+  ok(`OpenRouter key saved to ${globalConfigFile()}.`);
+}
+
+// Get a key into place: --key flag > already set (env or global config) >
+// TTY prompt. Dies without touching the repo config if none is available.
+async function ensureAgentKey(args) {
+  const i = args.indexOf("--key");
+  const flagKey = i !== -1 ? (args[i + 1] || "").trim() : null;
+  if (i !== -1 && !flagKey) die("--key needs a value: autogit on --agent --key <key>");
+  const { key: existing, baseUrl } = agentSettings(null);
+  if (flagKey) { await saveKey(flagKey, baseUrl); return; }
+  if (existing) return;
+  if (!process.stdin.isTTY)
+    die("agent mode needs an OpenRouter API key — rerun with: autogit on --agent --key <key>");
+  console.error("autogit: agent mode sends each turn's diff to OpenRouter for review.");
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  let key = "";
+  try { key = (await rl.question("  OpenRouter API key (from https://openrouter.ai/keys): ")).trim(); }
+  catch {} // Ctrl+C / Ctrl+D
+  finally { rl.close(); }
+  if (!key) die("no key entered — agent mode not enabled.");
+  await saveKey(key, baseUrl);
+}
+
+// Merge fields into .autogit.json, preserving anything else in it.
+function updateRepoConfig(p, fields) {
+  let cfg = {};
+  if (existsSync(p)) { try { cfg = JSON.parse(readFileSync(p, "utf8")); } catch {} }
+  Object.assign(cfg, fields);
+  writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n");
+}
+
+// Key first (may die), repo config second — a failed key setup must leave the
+// repo exactly as it was.
+async function enableAgentMode(p, args) {
+  await ensureAgentKey(args);
+  const i = args.indexOf("--model");
+  const model = i !== -1 ? (args[i + 1] || "").trim() : null;
+  if (i !== -1 && !model) die(`--model needs a value, e.g. --model ${DEFAULT_MODEL}`);
+  updateRepoConfig(p, model ? { mode: "agent", model } : { mode: "agent" });
+  const effective = model || agentSettings(null).model;
+  ok(`agent mode ON — ${effective} reviews every turn before it ships.`);
+}
+
 // ---------- ship ----------
 
 function autoMessage(stagedFiles) {
@@ -580,17 +800,17 @@ function readStdinPayload() {
   } catch { return null; }
 }
 
-function cmdShip(args) {
+async function cmdShip(args) {
   const payload = readStdinPayload();
   // Cursor reports turn status — never ship aborted or errored turns
   if (payload?.status && payload.status !== "completed") process.exit(0);
   // Cursor hooks run from ~/.cursor; the real project dirs come in the payload
   const roots = payload?.workspace_roots?.length ? payload.workspace_roots : [process.cwd()];
   const id = sessionId(payload, args);
-  for (const dir of roots) shipRepo(dir, args, id, payload);
+  for (const dir of roots) await shipRepo(dir, args, id, payload);
 }
 
-function shipRepo(dir, args, id, payload) {
+async function shipRepo(dir, args, id, payload) {
   try { process.chdir(dir); } catch { return; }
 
   // silent no-op unless this is a repo that opted in — hooks fire everywhere
@@ -614,7 +834,7 @@ function shipRepo(dir, args, id, payload) {
   let config;
   try { config = { ...DEFAULTS, ...JSON.parse(readFileSync(cfgPath, "utf8")) }; }
   catch { die(`${CONFIG_FILE} is not valid JSON.`); }
-  if (config.mode !== "auto") {
+  if (config.mode !== "auto" && config.mode !== "agent") {
     console.error(`autogit: mode "${config.mode}" not supported yet — skipping.`);
     return;
   }
@@ -639,20 +859,36 @@ function shipRepo(dir, args, id, payload) {
   const branch = config.branch === "current" ? git("rev-parse", "--abbrev-ref", "HEAD").out : config.branch;
   if (branch === "HEAD") { git("reset"); die("detached HEAD — won't auto-push."); }
 
-  // subject: explicit -m > this turn's prompt (busy marker, payload, or
-  // transcript) > the agent's final message (Codex Stop payload) > file list.
-  // Trailer marks the commit as ours.
+  // subject: explicit -m > agent-mode message > this turn's prompt (busy
+  // marker, payload, or transcript) > the agent's final message (Codex Stop
+  // payload) > file list. Trailer marks the commit as ours.
   let prompt = storedPrompt || promptText(payload)
     || (payload?.transcript_path ? lastPromptFromTranscript(payload.transcript_path) : null)
     || (typeof payload?.last_assistant_message === "string" && payload.last_assistant_message.trim()
         ? payload.last_assistant_message : null);
   // a prompt with a pasted secret never becomes the subject — file list instead
-  // (deliberate: --force-secrets does NOT override this)
+  // (deliberate: --force-secrets does NOT override this). Nulling it here also
+  // keeps it out of the agent-mode review call below.
   if (prompt && hasSecret(prompt)) {
     console.error("autogit: prompt looks like it contains a secret — using file-list commit subject.");
     prompt = null;
   }
-  const subject = message || (prompt ? subjectFrom(prompt) : autoMessage(staged));
+
+  // agent mode: one LLM call decides ship-vs-hold and writes the subject.
+  // Runs after every local gate (opt-in, defer, secrets, branch) so a blocked
+  // turn never burns a call. An explicit -m is human intent — skip the gate.
+  let agentSubject = null;
+  if (config.mode === "agent" && !message) {
+    const gate = await agentGate(prompt, config);
+    if (gate.hold) {
+      git("reset");
+      console.error(`autogit: agent held this turn — ${gate.hold} (kept locally; re-reviewed next turn)`);
+      return;
+    }
+    agentSubject = gate.subject; // null when the review failed open
+  }
+
+  const subject = message || agentSubject || (prompt ? subjectFrom(prompt) : autoMessage(staged));
   const commit = git("commit", "-m", subject, "-m", SHIP_TRAILER);
   if (!commit.ok) die(`commit failed:\n${commit.out}`);
 
@@ -767,10 +1003,20 @@ function cmdStatus() {
 
   const root = repoRootOrNull();
   if (!root) { console.log("repo:   not inside a git repository"); return; }
-  const on = existsSync(path.join(root, CONFIG_FILE));
+  const cfgFile = path.join(root, CONFIG_FILE);
+  const on = existsSync(cfgFile);
+  let repoCfg = null;
+  if (on) { try { repoCfg = JSON.parse(readFileSync(cfgFile, "utf8")); } catch {} }
+  const agentOn = repoCfg?.mode === "agent";
   const acct = git("config", "credential.username");
   console.log(`repo:   ${root}`);
-  console.log(`        auto-push ${on ? "ON" : "OFF — run: autogit on"}${acct.ok && acct.out ? ` · pushes as ${acct.out}` : ""}`);
+  console.log(`        auto-push ${on ? "ON" : "OFF — run: autogit on"}`
+    + (agentOn ? ` · agent mode (${agentSettings(repoCfg).model})` : "")
+    + (acct.ok && acct.out ? ` · pushes as ${acct.out}` : ""));
+  // a missing key means every turn silently falls back to plain auto-push —
+  // status is where that misconfig becomes visible
+  if (agentOn && !agentSettings(repoCfg).key)
+    console.log("        agent key: MISSING — reviews are skipped. Fix: autogit on --agent --key <key>");
 
   // Reuse the same sweep as ship so status cleans stale/dead ghosts too. Do not
   // reap same-pid markers here: status may be called mid-turn by that agent.
@@ -792,7 +1038,7 @@ switch (cmd) {
   case "setup": cmdSetup(); break;
   case "on": await cmdOn(args); break;
   case "off": cmdOff(); break;
-  case "ship": cmdShip(args); break;
+  case "ship": await cmdShip(args); break;
   case "undo": cmdUndo(); break;
   case "busy": cmdBusy(args); break;
   case "status": cmdStatus(); break;
@@ -814,6 +1060,11 @@ switch (cmd) {
 on flags:
   --public-ok       Enable without the public-GitHub-repo confirmation
   --account <user>  Pin which GitHub account pushes this repo (multi-account gh setups)
+  --agent           Agent mode: an LLM (via your OpenRouter key) reviews each turn's
+                    diff — holds junk/WIP, writes descriptive commit messages
+  --key <key>       Save the OpenRouter API key (stored in ~/.autogit/config.json)
+  --model <id>      Model for this repo's reviews (default: ${DEFAULT_MODEL})
+  --auto            Back to plain auto-push (agent mode off, auto-push stays on)
 
 ship flags:
   -m "message"      Commit message (defaults to the turn's prompt, else the file list)
@@ -826,3 +1077,4 @@ the last one to finish ships everything. Use worktrees for full isolation.`);
 
 // Exported for tests (importing this file is a no-op thanks to the isMain guard).
 export { agentPid, isAlive, writeMarker, readMarker, takeOwnMarker, sweepBusy, sweepBusyMarkers, busyDir, markerPath, BUSY_TTL_MS };
+export { parseDecision, buildReviewRequest, agentDecide, agentSettings, MAX_DIFF_CHARS, DEFAULT_MODEL };
