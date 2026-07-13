@@ -1,7 +1,7 @@
 {
   "name": "@davidondrej/autogit",
   "version": "0.9.1",
-  "description": "Auto stage→commit→push for agentic engineers. Works with any coding agent.",
+  "description": "Auto stage→commit→push for agentic engineers. Works with any coding agent. Agent mode adds an LLM review before every push.",
   "author": "David Ondrej",
   "repository": {
     "type": "git",
