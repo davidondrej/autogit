@@ -16,6 +16,7 @@ Everything about the project — what it is, architecture, internals, roadmap �
 - Treat the implementation as a reference of product intent, not fixed architecture.
 - Confirm any major structural change with the owner before implementing.
 - Roadmap items are owner-gated: don't build them without a go-ahead.
+- Default LLM model is David's call — never pick a Gemini model as a default.
 - When behavior or architecture changes, update README.md.
 - David's machine runs autogit via `npm link` — the global binary symlinks to this repo. Never tell him to update/reinstall it; he always runs the live source.
 - This repo has autogit enabled on itself. Your turns auto-commit and auto-push — don't push manually or assume changes are unpushed.

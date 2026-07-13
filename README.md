@@ -71,7 +71,7 @@ autogit on --agent    # asks for an OpenRouter API key once per machine
 - **Key never touches the repo** — it lives in `~/.autogit/config.json` (mode 0600). The `OPENROUTER_API_KEY` env var overrides it. Agents enable with `autogit on --agent --key <key>`.
 - **Undo works unchanged** — agent-shipped commits carry the same trailer.
 
-Model: defaults to `google/gemini-2.5-flash-lite` (fast, ~free at diff-review volumes). Pin per repo with `--model <id>` (stored in `.autogit.json`), or set a machine default (`model` in `~/.autogit/config.json`). A `baseUrl` there points the calls at any OpenAI-compatible endpoint. Back to plain auto-push: `autogit on --auto`.
+Model: defaults to `z-ai/glm-5.2` (fast, ~free at diff-review volumes). Pin per repo with `--model <id>` (stored in `.autogit.json`), or set a machine default (`model` in `~/.autogit/config.json`). A `baseUrl` there points the calls at any OpenAI-compatible endpoint. Back to plain auto-push: `autogit on --auto`.
 
 ## Safety
 

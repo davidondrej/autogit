@@ -536,7 +536,7 @@ function sweepBusy(root, myPid) {
 // tree; next turn's `git add -A` re-stages them and the agent re-decides.
 
 const OPENROUTER_URL = "https://openrouter.ai/api/v1";
-const DEFAULT_MODEL = "google/gemini-2.5-flash-lite"; // cheap + fast; override with --model or global config
+const DEFAULT_MODEL = "z-ai/glm-5.2"; // cheap + fast; override with --model or global config
 const AGENT_TIMEOUT_MS = 15_000; // hooks have their own ~60s timeouts — stay well under
 const MAX_DIFF_CHARS = 50_000;   // huge turns send a truncated diff, not a blown context
 
