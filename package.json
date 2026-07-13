@@ -1,6 +1,6 @@
 {
   "name": "@davidondrej/autogit",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Auto stage→commit→push for agentic engineers. Works with any coding agent.",
   "author": "David Ondrej",
   "repository": {
