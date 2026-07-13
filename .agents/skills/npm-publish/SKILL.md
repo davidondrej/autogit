@@ -63,3 +63,4 @@ Total time when auth is fresh: ~30 seconds. Two passkey touches max (login + pub
 
 - 2026-07-03: publishing 0.7.2 hit E404 on PUT — auth token was stale. `npm login` fixed it (browser + passkey), then publish worked but paused for its own browser passkey confirmation. E404 = re-auth, nothing else.
 - 2026-07-04: publishing 0.8.0 — E404 again on the session's first publish. Token had gone stale overnight (second day in a row). Pattern: expect E404 on the first publish of each new session; `npm login` first, then publish.
+- 2026-07-13: publishing 0.9.0 — E404 on first publish, third session in a row. Pattern confirmed: ALWAYS send `npm login` before the first publish of a session.
