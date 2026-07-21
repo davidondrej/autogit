@@ -8,7 +8,7 @@
 //   autogit status    show hooks + repo state
 //   autogit update    update autogit to the latest version from npm
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, utimesSync, realpathSync, chmodSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, utimesSync, realpathSync, chmodSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -126,6 +126,15 @@ function ensure(cfg, needle, add) {
   if (!JSON.stringify(cfg).includes(needle)) add(cfg);
 }
 
+function replaceExactCommand(value, from, to) {
+  if (Array.isArray(value)) { for (const item of value) replaceExactCommand(item, from, to); return; }
+  if (!value || typeof value !== "object") return;
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "command" && child === from) value[key] = to;
+    else replaceExactCommand(child, from, to);
+  }
+}
+
 // Claude settings.json and Codex hooks.json share the same event entry shape.
 function claudeStyleEntry(cfg, event, command) {
   cfg.hooks ??= {};
@@ -136,10 +145,16 @@ function claudeStyleEntry(cfg, event, command) {
 function setupClaude() {
   if (!existsSync(path.join(homedir(), ".claude"))) return "not installed — skipped";
   const file = path.join(homedir(), ".claude", "settings.json");
-  // cd to the project dir: Claude hooks don't guarantee the working directory
-  const ship = 'cd "${CLAUDE_PROJECT_DIR:-.}" && autogit ship';
-  const busy = 'cd "${CLAUDE_PROJECT_DIR:-.}" && autogit busy';
+  const oldShip = 'cd "${CLAUDE_PROJECT_DIR:-.}" && autogit ship';
+  const oldBusy = 'cd "${CLAUDE_PROJECT_DIR:-.}" && autogit busy';
+  // Cursor imports Claude hooks, so its native autogit hooks must be the only
+  // copies with side effects. Claude Code does not set CURSOR_VERSION.
+  const cursorSafe = command => `[ -n "\${CURSOR_VERSION:-}" ] || { ${command}; }`;
+  const ship = cursorSafe(oldShip);
+  const busy = cursorSafe(oldBusy);
   return updateJson(file, cfg => {
+    replaceExactCommand(cfg, oldShip, ship);
+    replaceExactCommand(cfg, oldBusy, busy);
     ensure(cfg, "autogit ship", c => claudeStyleEntry(c, "Stop", ship));
     ensure(cfg, "autogit busy", c => {
       claudeStyleEntry(c, "UserPromptSubmit", busy);
@@ -452,8 +467,85 @@ function sessionId(payload, args) {
   return raw ? String(raw) : null;
 }
 
+function safeSessionId(id) {
+  return `session-${id.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 160)}`;
+}
+
 function markerPath(root, id) {
-  return path.join(busyDir(root), id.replace(/[^A-Za-z0-9._-]/g, "_"));
+  return path.join(busyDir(root), safeSessionId(id));
+}
+
+function isCursorPayload(payload) {
+  return !!payload && (typeof payload.cursor_version === "string" || Array.isArray(payload.workspace_roots));
+}
+
+function cursorSessionFile(id) {
+  return path.join(autogitHome(), "cursor-sessions", `${safeSessionId(id)}.json`);
+}
+
+function cursorGenerationId(payload) {
+  return payload?.generation_id == null ? null : String(payload.generation_id);
+}
+
+function rememberCursorRepo(payload, id, root) {
+  if (!isCursorPayload(payload) || !id || !root) return;
+  const file = cursorSessionFile(id);
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    chmodSync(path.dirname(file), 0o700);
+    writeFileSync(tmp, JSON.stringify({ generationId: cursorGenerationId(payload), root }), { mode: 0o600 });
+    renameSync(tmp, file);
+    chmodSync(file, 0o600);
+  } catch { try { unlinkSync(tmp); } catch {} }
+}
+
+function takeCursorRepo(payload, id) {
+  if (!isCursorPayload(payload) || !id) return null;
+  const file = cursorSessionFile(id);
+  try {
+    const state = JSON.parse(readFileSync(file, "utf8"));
+    unlinkSync(file);
+    if ((state.generationId ?? null) !== cursorGenerationId(payload)) return null;
+    return typeof state.root === "string" ? state.root : null;
+  } catch { return null; }
+}
+
+function payloadWorkingDirectories(payload) {
+  const dirs = [
+    payload?.cwd,
+    payload?.working_directory,
+    payload?.tool_input?.cwd,
+    payload?.tool_input?.working_directory
+  ].filter(dir => typeof dir === "string" && path.isAbsolute(dir));
+  return [...new Set(dirs)];
+}
+
+function workspaceDirectories(payload) {
+  const roots = Array.isArray(payload?.workspace_roots)
+    ? payload.workspace_roots.filter(dir => typeof dir === "string" && path.isAbsolute(dir))
+    : [];
+  return roots.length ? roots : [process.cwd()];
+}
+
+function optedInRepoRoot(dir) {
+  if (typeof dir !== "string") return null;
+  const previous = process.cwd();
+  try {
+    process.chdir(dir);
+    const root = repoRootOrNull();
+    return root && existsSync(path.join(root, CONFIG_FILE)) ? root : null;
+  } catch { return null; }
+  finally { try { process.chdir(previous); } catch {} }
+}
+
+function optedInRepoRoots(dirs) {
+  const roots = [];
+  for (const dir of dirs) {
+    const root = optedInRepoRoot(dir);
+    if (root && !roots.includes(root)) roots.push(root);
+  }
+  return roots;
 }
 
 // `autogit busy` — called by agent start/tool hooks; touches this session's marker.
@@ -467,12 +559,12 @@ function cmdBusy(args) {
   if (!id) return; // no session id → no marker: nobody could ever clear it
   const prompt = promptText(payload);
   const pid = agentPid(); // stamped into the marker so ship can check liveness
-  const roots = payload?.workspace_roots?.length ? payload.workspace_roots : [process.cwd()];
-  for (const dir of roots) {
+  const actualRoots = optedInRepoRoots(payloadWorkingDirectories(payload));
+  const roots = actualRoots.length ? actualRoots : optedInRepoRoots(workspaceDirectories(payload));
+  if (actualRoots.length) rememberCursorRepo(payload, id, actualRoots[0]);
+  for (const root of roots) {
     try {
-      process.chdir(dir);
-      const root = repoRootOrNull();
-      if (!root || !existsSync(path.join(root, CONFIG_FILE))) continue; // only opted-in repos
+      process.chdir(root);
       const marker = markerPath(root, id);
       mkdirSync(path.dirname(marker), { recursive: true });
       if (prompt || !existsSync(marker)) writeMarker(marker, pid, prompt);
@@ -542,8 +634,12 @@ const MAX_DIFF_CHARS = 50_000;   // huge turns send a truncated diff, not a blow
 
 // The key lives machine-global, never in the repo — .autogit.json is often
 // committed. AUTOGIT_HOME is honored so tests (and dotfile setups) can relocate it.
+function autogitHome() {
+  return path.join(process.env.AUTOGIT_HOME || homedir(), ".autogit");
+}
+
 function globalConfigFile() {
-  return path.join(process.env.AUTOGIT_HOME || homedir(), ".autogit", "config.json");
+  return path.join(autogitHome(), "config.json");
 }
 
 function readGlobalConfig() {
@@ -758,11 +854,34 @@ function promptText(payload) {
   return null;
 }
 
+function collectWorkingDirectories(value, found) {
+  if (Array.isArray(value)) { for (const item of value) collectWorkingDirectories(item, found); return; }
+  if (!value || typeof value !== "object") return;
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "working_directory" && typeof child === "string" && path.isAbsolute(child)) found.push(child);
+    else collectWorkingDirectories(child, found);
+  }
+}
+
+// Cursor records tool working directories inside each JSONL turn. Only inspect
+// the current turn so a resumed session cannot ship a repo touched hours ago.
+function cursorTurnWorkingDirectories(file) {
+  try {
+    const lines = readFileSync(file, "utf8").split("\n");
+    const found = [];
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].trim()) continue;
+      let e; try { e = JSON.parse(lines[i]); } catch { continue; }
+      if (e?.role === "user") break;
+      collectWorkingDirectories(e, found);
+    }
+    return [...new Set(found)];
+  } catch { return []; }
+}
+
 // Stop payloads carry no prompt, but point at the session transcript.
-// Claude transcripts and Codex rollouts are both JSONL — walk backwards for
-// the last real user message. Line shapes (officially unstable; parse defensively):
-//   Claude: {"type":"user","message":{"content":"..."|[{"type":"text","text":"..."}]}}
-//   Codex:  {"type":"event_msg","payload":{"type":"user_message","message":"..."}}
+// Cursor, Claude, and Codex transcripts are JSONL — walk backwards for the
+// last real user message. Line shapes are unstable, so parse defensively.
 function lastPromptFromTranscript(file) {
   try {
     const lines = readFileSync(file, "utf8").split("\n");
@@ -770,7 +889,7 @@ function lastPromptFromTranscript(file) {
       if (!lines[i].trim()) continue;
       let e; try { e = JSON.parse(lines[i]); } catch { continue; }
       let text;
-      if (e.type === "user" && !e.isMeta) { // Claude
+      if ((e.type === "user" || e.role === "user") && !e.isMeta) { // Claude / Cursor
         const c = e.message?.content;
         text = typeof c === "string" ? c
           : Array.isArray(c) ? c.filter(p => p.type === "text").map(p => p.text).join(" ") : "";
@@ -802,12 +921,29 @@ function readStdinPayload() {
 
 async function cmdShip(args) {
   const payload = readStdinPayload();
-  // Cursor reports turn status — never ship aborted or errored turns
-  if (payload?.status && payload.status !== "completed") process.exit(0);
-  // Cursor hooks run from ~/.cursor; the real project dirs come in the payload
-  const roots = payload?.workspace_roots?.length ? payload.workspace_roots : [process.cwd()];
   const id = sessionId(payload, args);
-  for (const dir of roots) await shipRepo(dir, args, id, payload);
+  const trackedRepo = takeCursorRepo(payload, id);
+  // Cursor reports turn status — never ship aborted or errored turns.
+  if (payload?.status && payload.status !== "completed") {
+    for (const root of optedInRepoRoots([trackedRepo])) {
+      process.chdir(root);
+      takeOwnMarker(root, id);
+    }
+    return;
+  }
+
+  let roots = optedInRepoRoots([trackedRepo]);
+  if (!roots.length) {
+    const transcriptDirs = isCursorPayload(payload) && payload?.transcript_path
+      ? cursorTurnWorkingDirectories(payload.transcript_path)
+      : [];
+    const actualRoots = optedInRepoRoots([...payloadWorkingDirectories(payload), ...transcriptDirs]);
+    if (actualRoots.length) roots = [actualRoots[0]];
+  }
+  // workspace_roots remains the multi-root fallback when Cursor did not expose
+  // a more precise cwd for this turn.
+  if (!roots.length) roots = optedInRepoRoots(workspaceDirectories(payload));
+  for (const root of roots) await shipRepo(root, args, id, payload);
 }
 
 async function shipRepo(dir, args, id, payload) {
